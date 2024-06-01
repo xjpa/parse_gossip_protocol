@@ -1,6 +1,8 @@
+use base64;
 use env_logger;
-use log::error;
-use rand::seq::SliceRandom;
+use log::{error, info};
+use rand::prelude::SliceRandom;
+use rand::Rng;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::digest::{Context, Digest, SHA256};
 use serde::{Deserialize, Serialize};
@@ -37,62 +39,133 @@ impl DataNode {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Request {
     command: String,
-    data: Option<Vec<u8>>,
+    data: Option<String>,
     hash: Option<String>,
+}
+
+fn generate_nonce() -> [u8; 12] {
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill(&mut nonce_bytes);
+    nonce_bytes
+}
+
+fn encrypt_data(key: &LessSafeKey, data: &[u8]) -> Vec<u8> {
+    let mut buffer = data.to_vec();
+    let nonce_bytes = generate_nonce();
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+    let aad = Aad::empty();
+    info!("Raw data before encryption: {:?}", data);
+    info!("Encrypting data with nonce: {:?}", nonce_bytes);
+    match key.seal_in_place_append_tag(nonce, aad, &mut buffer) {
+        Ok(_) => info!("Data encrypted successfully"),
+        Err(e) => error!("Encryption failed: {:?}", e),
+    };
+    let encrypted_data = [nonce_bytes.as_slice(), buffer.as_slice()].concat();
+    info!("Encrypted data: {:?}", encrypted_data);
+    encrypted_data
+}
+
+fn decrypt_data(key: &LessSafeKey, data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 12 {
+        error!("Data length less than nonce length");
+        return None;
+    }
+    let (nonce_bytes, ciphertext) = data.split_at(12);
+    let nonce = Nonce::try_assume_unique_for_key(nonce_bytes).ok()?;
+    let aad = Aad::empty();
+    let mut buffer = ciphertext.to_vec();
+    info!("Decrypting data with nonce: {:?}", nonce_bytes);
+    match key.open_in_place(nonce, aad, &mut buffer) {
+        Ok(decrypted_data) => {
+            info!("Data decrypted successfully");
+            let valid_utf8 = decrypted_data.iter().all(|&b| b.is_ascii());
+            if valid_utf8 {
+                info!("Valid ASCII data: {:?}", decrypted_data);
+                Some(decrypted_data.to_vec())
+            } else {
+                error!("Invalid ASCII data detected: {:?}", decrypted_data);
+                None
+            }
+        }
+        Err(e) => {
+            error!("Decryption failed: {:?}", e);
+            None
+        }
+    }
 }
 
 fn handle_client(mut stream: TcpStream, node: DataNode, encryption_key: Arc<LessSafeKey>) {
     let mut buffer = [0; 1024];
     match stream.read(&mut buffer) {
-        Ok(_) => {
-            let nonce = Nonce::assume_unique_for_key([0u8; 12]);
-            let aad = Aad::empty();
-            match encryption_key.open_in_place(nonce, aad, &mut buffer) {
-                Ok(decrypted_data) => {
-                    let request: Request = match serde_json::from_slice(decrypted_data) {
-                        Ok(req) => req,
-                        Err(_) => {
-                            error!("Failed to parse request");
-                            return;
-                        }
-                    };
-
-                    match request.command.as_str() {
-                        "GET" => {
-                            if let Some(hash_hex) = request.hash {
-                                let hash = match hex::decode(hash_hex) {
-                                    Ok(h) => h,
-                                    Err(_) => {
-                                        error!("Failed to decode hash");
-                                        return;
-                                    }
-                                };
-                                if let Some(content) = node.get_content(&hash) {
-                                    stream.write(&content).unwrap();
+        Ok(size) => {
+            info!("Received {} bytes from client", size);
+            info!("Raw received data: {:?}", &buffer[..size]);
+            if let Some(decrypted_data) = decrypt_data(&encryption_key, &buffer[..size]) {
+                info!("Decrypted data: {:?}", decrypted_data);
+                if let Ok(decrypted_string) = String::from_utf8(decrypted_data.clone()) {
+                    info!("Decrypted string: {}", decrypted_string);
+                } else {
+                    error!("Failed to convert decrypted data to string");
+                }
+                let hex_data: Vec<String> = decrypted_data
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect();
+                info!("Hex data: {:?}", hex_data);
+                let request: Request = match serde_json::from_slice(&decrypted_data) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        error!("Failed to parse request: {:?}", e);
+                        return;
+                    }
+                };
+                info!("Parsed request: {:?}", request);
+                match request.command.as_str() {
+                    "GET" => {
+                        if let Some(hash_hex) = request.hash {
+                            let hash = match hex::decode(hash_hex) {
+                                Ok(h) => h,
+                                Err(e) => {
+                                    error!("Failed to decode hash: {:?}", e);
+                                    return;
                                 }
+                            };
+                            if let Some(content) = node.get_content(&hash) {
+                                let response = encrypt_data(&encryption_key, &content);
+                                stream.write_all(&response).unwrap();
+                                info!("Sent encrypted response: {:?}", response);
                             }
-                        }
-                        "PUT" => {
-                            if let Some(content) = request.data {
-                                let hash = node.add_content(content);
-                                stream.write(hex::encode(hash).as_bytes()).unwrap();
-                            }
-                        }
-                        _ => {
-                            error!("Unknown command");
                         }
                     }
+                    "PUT" => {
+                        if let Some(content_base64) = request.data {
+                            let content = match base64::decode(content_base64) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    error!("Failed to decode base64 content: {:?}", e);
+                                    return;
+                                }
+                            };
+                            let hash = node.add_content(content);
+                            let response =
+                                encrypt_data(&encryption_key, &hex::encode(hash).as_bytes());
+                            stream.write_all(&response).unwrap();
+                            info!("Sent encrypted response: {:?}", response);
+                        }
+                    }
+                    _ => {
+                        error!("Unknown command");
+                    }
                 }
-                Err(_) => {
-                    error!("Failed to decrypt data");
-                }
+            } else {
+                error!("Failed to decrypt data");
             }
         }
-        Err(_) => {
-            error!("Failed to read from stream");
+        Err(e) => {
+            error!("Failed to read from stream: {:?}", e);
         }
     }
 }
@@ -109,7 +182,7 @@ fn start_server(address: &str, node: DataNode, encryption_key: Arc<LessSafeKey>)
                 });
             }
             Err(e) => {
-                error!("Failed to accept connection: {}", e);
+                error!("Failed to accept connection: {:?}", e);
             }
         }
     }
@@ -124,20 +197,14 @@ fn gossip(node: DataNode, peers: Vec<String>, encryption_key: Arc<LessSafeKey>) 
             for (hash, content) in data.iter() {
                 let message = Request {
                     command: "PUT".to_string(),
-                    data: Some(content.clone()),
+                    data: Some(base64::encode(content)),
                     hash: Some(hex::encode(hash)),
                 };
 
                 let serialized_message = serde_json::to_vec(&message).unwrap();
-
-                let mut buffer = serialized_message.clone();
-                let nonce = Nonce::assume_unique_for_key([0u8; 12]);
-                let aad = Aad::empty();
-                encryption_key
-                    .seal_in_place_append_tag(nonce, aad, &mut buffer)
-                    .unwrap();
-
-                stream.write(&buffer).unwrap();
+                let encrypted_message = encrypt_data(&encryption_key, &serialized_message);
+                stream.write_all(&encrypted_message).unwrap();
+                info!("Sent encrypted gossip message: {:?}", encrypted_message);
             }
         }
         thread::sleep(Duration::from_secs(10));
