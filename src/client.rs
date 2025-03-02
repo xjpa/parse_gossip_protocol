@@ -45,9 +45,9 @@ fn decrypt_data(key: &LessSafeKey, data: &[u8]) -> Option<Vec<u8>> {
     let mut buffer = ciphertext.to_vec();
     println!("Decrypting data with nonce: {:?}", nonce_bytes);
     match key.open_in_place(nonce, aad, &mut buffer) {
-        Ok(_) => {
+        Ok(plaintext) => {
             println!("Data decrypted successfully");
-            Some(buffer)
+            Some(plaintext.to_vec())
         }
         Err(e) => {
             println!("Decryption failed: {:?}", e);
